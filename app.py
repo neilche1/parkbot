@@ -107,7 +107,7 @@ TENANTS = {
     ("Reynaldo Chinchilla", "129 Monteg"): {"balance": "$0.00", "due_date": "1st", "phones": []},
     ("JESUS MORALEZ", "130 Monteg"): {"balance": "$5.00", "due_date": "1st", "phones": []},
     ("EDER JACIEL ORTIZ LOPEZ", "130 Oswld"): {"balance": "$0.00", "due_date": "1st", "phones": []},
-    ("ANA CARDONA KEVIN GUZMAN", "131 Monteg"): {"balance": "$0.10", "due_date": "1st", "phones": []},
+    ("ANA CARDONA KEVIN GUZMAN", "131 Monteg"): {"balance  "due_date": "1st", "phones": []},
     ("Meryoneyda Osorio", "131 Oswld"): {"balance": "$17244.99", "due_date": "1st", "phones": []},
     ("IRWIN CABRERA", "131Betty"): {"balance": "$920.00", "due_date": "1st", "phones": []},
     ("DORA BRIZUELA", "132 Monteg"): {"balance": "$0.00", "due_date": "1st", "phones": []},
@@ -138,14 +138,14 @@ TENANTS = {
     ("Felipe Lucero", "149 Oswld"): {"balance": "$0.00", "due_date": "1st", "phones": []},
     ("Abigail Perez", "150 Oswld"): {"balance": "$9111.02", "due_date": "1st", "phones": []},
     ("jose suazo", "151 Monteg"): {"balance": "$500.00", "due_date": "1st", "phones": []},
-    ("Griselda Chavez", "151 Oswld"): {"balance": "$3.90", "due_date": "1st", "phones": []},
+    ("Griselda Chavez", "151 WLoop"): {"balance": "$3.90", "due_date": "1st", "phones": []},
     ("CARMINA ROJAS", "152 Monteg"): {"balance": "$0.00", "due_date": "1st", "phones": []},
     ("MIRIAN BUSTILLO AVILA", "152 Oswld"): {"balance": "$0.00", "due_date": "1st", "phones": []},
     ("virginia hernandez", "152Betty"): {"balance": "$0.00", "due_date": "1st", "phones": []},
     ("marina cortez", "153 Monteg"): {"balance": "-$0.85", "due_date": "1st", "phones": []},
     ("Marcial Gomez", "153 Oswld"): {"balance": "$0.00", "due_date": "1st", "phones": []},
     ("ARTEMIO MORENO", "153Betty"): {"balance": "$0.00", "due_date": "1st", "phones": []},
-    ("jose arizaga ibarra", "154 Oswld"): {"balance": "-$0.64", "due_dates": "1st", "phones": []},
+    ("jose arizaga ibarra", "154 Oswld"): {"balance": "-$0.64", "due_date": "1st", "phones": []},
     ("YEKSON MARQUEZ", "155 Oswld"): {"balance": "-$5.00", "due_date": "1st", "phones": []},
     ("Erminda Rodriguez-Gutierrez", "156 Oswld"): {"balance": "-$0.20", "due_date": "1st", "phones": []},
     ("AMALIA ARRIAGA", "156Betty"): {"balance": "$0.00", "due_date": "1st", "phones": []},
@@ -349,12 +349,19 @@ def identify_tenant(name, lot):
 
 def get_ai_response(user_input, tenant_data):
     prompt = f"Act as a mobile home park manager. Tenant data: {tenant_data}. Query: {user_input}"
-    response = openai.Completion.create(
-        model="gpt-3.5-turbo",
-        prompt=prompt,
-        max_tokens=50
-    )
-    return response.choices[0].text.strip()
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a mobile home park manager assisting tenants."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=50
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"Error in get_ai_response: {str(e)}")
+        return "I’m sorry, I couldn’t process your request at this time. Please try again later or contact the park manager directly."
 
 def send_sms(to_number, message):
     print(f"Sending SMS to {to_number}: {message}")
