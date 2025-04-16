@@ -624,6 +624,7 @@ def get_ai_response(user_input, tenant_data, conversation_language, message_hist
         if check_for_end:
             system_prompt += (
                 "Based on the conversation history and the current query, determine if the tenant intends to end the conversation. "
+                "Look for phrases like 'He terminado', 'Eso es todo', 'Gracias', 'Adiós', 'I'm done', 'That's all', 'Thank you', 'Goodbye', etc. "
                 "If the tenant wants to end, respond with 'END_CONVERSATION'. Otherwise, respond with 'CONTINUE'."
             )
         else:
@@ -670,6 +671,10 @@ def get_ai_response(user_input, tenant_data, conversation_language, message_hist
         response = call_xai()
         end_time = datetime.datetime.now()
         logger.info(f"get_ai_response completed in {(end_time - start_time).total_seconds() * 1000:.2f} ms")
+        if check_for_end:
+            intent_response = response["choices"][0]["message"]["content"].strip()
+            logger.info(f"Intent detection response: {intent_response}")
+            return intent_response
         return response["choices"][0]["message"]["content"].strip()
     except Exception as e:
         logger.error(f"Error in get_ai_response after retries: {str(e)}")
@@ -869,6 +874,7 @@ def sms_reply():
             return "OK"
         else:
             CURRENT_CONVERSATIONS[from_number]["last_message_time"] = current_time
+            # Do not update language; use initial_language
             # Reset pending end if tenant responds
             if CURRENT_CONVERSATIONS[from_number].get("pending_end", False):
                 CURRENT_CONVERSATIONS[from_number]["pending_end"] = False
@@ -986,7 +992,7 @@ def sms_reply():
     logger.info(f"Accessing tenant_key for {from_number}: {tenant_key} (type: {type(tenant_key)})")
     tenant_data = TENANTS[tenant_key]
 
-    # Check if the message contains a name that doesn’t match the identified tenant
+    # Check if the message contains a name that conflicts with the identified tenant
     input_name = " ".join(message_lower.split()).strip()
     current_first_name = tenant_key[1].lower()
     current_last_name = tenant_key[2].lower()
@@ -1057,23 +1063,7 @@ def sms_reply():
     elif needs_transactions:
         logger.info(f"Transactions already fetched for TenantID={tenant_key[0]}. Skipping redundant fetch.")
 
-    # Check if the tenant intends to end the conversation *before* generating a reply
-    intent = get_ai_response(message, tenant_data, conversation_language, message_history, check_for_end=True, include_transactions=False)
-    if intent == "END_CONVERSATION":
-        if conversation_language == "es":
-            goodbye_msg = "¡Adiós! Si necesitas más ayuda, no dudes en contactarme."
-        else:
-            goodbye_msg = "Goodbye! Feel free to reach out if you need further assistance."
-        send_sms(from_number, goodbye_msg)
-        CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": goodbye_msg})
-        del CURRENT_CONVERSATIONS[from_number]
-        if from_number in PENDING_IDENTIFICATION:
-            del PENDING_IDENTIFICATION[from_number]
-        logger.info(f"Conversation ended for {from_number} based on AI intent detection")
-        save_conversations()
-        return "OK"
-
-    # Handle the tenant's query only if the intent is not to end the conversation
+    # Handle the tenant's query
     if "maintenance" in message_lower or "fix" in message_lower or "broken" in message_lower or "leak" in message_lower or "leaking" in message_lower or "flood" in message_lower or "damage" in message_lower or "repair" in message_lower or "clog" in message_lower or "power" in message_lower:
         tenant_name = f"{tenant_key[1]} {tenant_key[2]}"
         tenant_lot = tenant_key[3]
@@ -1146,7 +1136,23 @@ def sms_reply():
         send_sms(from_number, reply)
         CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": reply})
 
-    save_conversations()
+    # Check if the tenant intends to end the conversation
+    intent = get_ai_response(message, tenant_data, conversation_language, message_history, check_for_end=True, include_transactions=False)
+    logger.info(f"Intent detected: {intent}")
+    if "END_CONVERSATION" in intent:
+        if conversation_language == "es":
+            goodbye_msg = "¡Adiós! Si necesitas más ayuda, no dudes en contactarme."
+        else:
+            goodbye_msg = "Goodbye! Feel free to reach out if you need further assistance."
+        send_sms(from_number, goodbye_msg)
+        CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": goodbye_msg})
+        del CURRENT_CONVERSATIONS[from_number]
+        if from_number in PENDING_IDENTIFICATION:
+            del PENDING_IDENTIFICATION[from_number]
+        logger.info(f"Conversation ended for {from_number} based on AI intent detection")
+        save_conversations()
+    else:
+        save_conversations()
     return "OK"
 
 @app.route("/voice", methods=["POST"])
