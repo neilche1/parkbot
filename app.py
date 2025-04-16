@@ -544,9 +544,11 @@ def get_ai_response(user_input, tenant_data, conversation_language, message_hist
         "payment_procedure": "Drop off at the park’s dropbox",
         "payee": "Unknown Park"
     })
-    # Include transactions only if needed
+    # Ensure transactions is always a list, even if None
     transactions = tenant_data.get("transactions", []) if include_transactions else []
-    if transactions:
+    if transactions is None:
+        transactions = []  # Default to empty list if transactions is None
+    if transactions and include_transactions:
         transactions.sort(key=lambda x: x.get("TransactionDate", ""), reverse=True)
     
     # Create a copy of tenant_data without transactions to avoid double-counting
@@ -1060,7 +1062,7 @@ def sms_reply():
         CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": reply})
 
     # Check if the tenant intends to end the conversation
-    intent = get_ai_response(message, tenant_data, conversation_language, message_history, check_for_end=True)
+    intent = get_ai_response(message, tenant_data, conversation_language, message_history, check_for_end=True, include_transactions=False)
     if intent == "END_CONVERSATION":
         if conversation_language == "es":
             goodbye_msg = "¡Adiós! Si necesitas más ayuda, no dudes en contactarme."
