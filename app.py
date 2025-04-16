@@ -11,6 +11,7 @@ from fuzzywuzzy import fuzz
 import logging
 import langdetect
 from collections import deque
+from dateutil.relativedelta import relativedelta
 
 app = Flask(__name__)
 
@@ -51,7 +52,7 @@ RENT_MANAGER_API_TOKEN = None
 MAINTENANCE_REQUESTS = []
 CALL_LOGS = []
 PENDING_IDENTIFICATION = {}
-CURRENT_CONVERSATIONS = {}  # Maps phone_number to {"tenant_key": (tenant_id, first_name, last_name, unit), "last_message_time": datetime, "pending_end": bool, "pending_identification": bool, "language": str, "initial_language": str, "message_history": deque}
+CURRENT_CONVERSATIONS = {}  # Maps phone_number to {"tenant_key": (tenant Неправильный формат: tenant_key должен быть кортежем, а не списком), "last_message_time": datetime, "pending_end": bool, "pending_identification": bool, "language": str, "initial_language": str, "message_history": deque}
 
 # File path for storing CURRENT_CONVERSATIONS
 CONVERSATIONS_FILE = "current_conversations.json"
@@ -552,8 +553,28 @@ def get_ai_response(user_input, tenant_data, conversation_language, message_hist
     transactions = tenant_data.get("transactions", []) if include_transactions else []
     if transactions is None:
         transactions = []  # Default to empty list if transactions is None
-    if transactions and include_transactions:
-        transactions.sort(key=lambda x: x.get("TransactionDate", ""), reverse=True)
+
+    # Handle statement requests with default time period if not specified
+    statement_period = None
+    filtered_transactions = transactions
+    if "statement" in user_input.lower() and include_transactions:
+        # Check if a specific time period is mentioned (e.g., "March", "last month")
+        current_date = datetime.datetime.now()
+        # Default to the last fully completed month if no period is specified
+        last_month = current_date - relativedelta(months=1)
+        start_date = last_month.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        end_date = (start_date + relativedelta(months=1)) - relativedelta(seconds=1)
+        statement_period = f"{start_date.strftime('%B %Y')}"
+        
+        # Filter transactions for the specified period
+        filtered_transactions = [
+            t for t in transactions
+            if t.get("TransactionDate") and start_date <= datetime.datetime.strptime(t["TransactionDate"], "%Y-%m-%dT%H:%M:%S") <= end_date
+        ]
+        logger.info(f"Filtered {len(filtered_transactions)} transactions for period {statement_period}")
+
+    if filtered_transactions and include_transactions:
+        filtered_transactions.sort(key=lambda x: x.get("TransactionDate", ""), reverse=True)
     
     # Create a copy of tenant_data without transactions to avoid double-counting
     tenant_data_copy = tenant_data.copy()
@@ -561,7 +582,7 @@ def get_ai_response(user_input, tenant_data, conversation_language, message_hist
         del tenant_data_copy["transactions"]
     
     # Estimate input token count more accurately
-    transaction_str = json.dumps(transactions)
+    transaction_str = json.dumps(filtered_transactions)
     tenant_data_str = json.dumps(tenant_data_copy)
     park_details_str = json.dumps(park_details)
     user_input_str = user_input
@@ -572,7 +593,7 @@ def get_ai_response(user_input, tenant_data, conversation_language, message_hist
     user_input_tokens = len(user_input_str) * 0.25
     message_history_tokens = len(message_history_str) * 0.25
     total_input_tokens = transaction_tokens + tenant_data_tokens + park_details_tokens + user_input_tokens + message_history_tokens
-    logger.info(f"Sending {len(transactions)} transactions to xAI API for tenant {tenant_data.get('tenant_id', 'Unknown')}. Estimated input tokens: {total_input_tokens:.0f}")
+    logger.info(f"Sending {len(filtered_transactions)} transactions to xAI API for tenant {tenant_data.get('tenant_id', 'Unknown')}. Estimated input tokens: {total_input_tokens:.0f}")
     logger.debug(f"Transaction string length: {len(transaction_str)}, Tenant data string length: {len(tenant_data_str)}, Park details string length: {len(park_details_str)}, User input length: {len(user_input_str)}, Message history length: {len(message_history_str)}")
     
     # Calculate the monthly rent charge based on transaction history
@@ -588,12 +609,14 @@ def get_ai_response(user_input, tenant_data, conversation_language, message_hist
     prompt = (
         f"Tenant data: {tenant_data_copy}. "
         f"Tenant is from park: {park_details}. "
-        f"All transactions: {transactions}. "
+        f"All transactions: {filtered_transactions}. "
         f"Monthly rent charge (if available): {rent_charge_str}. "
         f"Conversation language: {conversation_language}. "
         f"Conversation history (last 5 messages, format [{{'role': 'user' or 'bot', 'content': message}}]): {message_history_str}. "
         f"Query: {user_input}"
     )
+    if statement_period:
+        prompt += f"\nStatement period (if applicable): {statement_period}."
     prompt_length = len(prompt)
     logger.debug(f"Prompt length: {prompt_length} characters")
     
@@ -617,6 +640,7 @@ def get_ai_response(user_input, tenant_data, conversation_language, message_hist
             "Use the tenant's full transaction history ('All transactions: {transactions}') for payment-related queries. "
             "For financial queries (e.g., balance, rent charge, payment history), use the tenant's balance, due date, monthly rent charge, and transaction history. "
             "For example, if asked 'What did I pay last month?', calculate the total payments made last month from the transaction history. "
+            "If asked for a statement (e.g., 'Give me my statement'), generate a detailed statement for the 'Statement period' (if provided), including all charges and payments within that period, and calculate the resulting balance. Format the statement clearly, e.g., 'Here’s your statement for [period]: Charges: [list charges with dates and amounts], Payments: [list payments with dates and amounts], Total Balance: [amount].' "
             "If asked about the rent charge, use the 'Monthly rent charge' if available, or infer from transaction history. "
             "For payment policies, state that tenants can be evicted for not paying utilities or other fees, as non-payment of any charges can lead to eviction. "
             "Do not suggest payment plans; encourage immediate payment or direct to the park office. "
@@ -686,7 +710,7 @@ def get_ai_response(user_input, tenant_data, conversation_language, message_hist
         logger.error(f"Error in get_ai_response after retries: {str(e)}")
         if check_for_end:
             return "CONTINUE"  # Default to continuing if intent check fails
-        if any(keyword in user_input.lower() for keyword in ["balance", "pay", "due", "payment history", "last payment", "recent transactions", "last month", "rent charge"]):
+        if any(keyword in user_input.lower() for keyword in ["balance", "pay", "due", "payment history", "last payment", "recent transactions", "last month", "rent charge", "statement"]):
             if conversation_language == "es":
                 return f"No pude procesar tu solicitud por completo, pero puedo decirte que tu saldo actual es {tenant_data['balance']}, con vencimiento el {tenant_data['due_date']} de cada mes. Para más detalles, intenta de nuevo más tarde o contacta a la oficina del parque al {PARK_OFFICE_PHONE}, disponible {PARK_OFFICE_HOURS}."
             else:
@@ -753,7 +777,7 @@ def refresh_tenants():
 @app.route("/check_inactive_conversations", methods=["GET"])
 def check_inactive_conversations():
     load_conversations()
-    current_time = datetime.datetime.now()
+    current多元 = datetime.datetime.now()
     conversations_to_close = []
     
     logger.info(f"Checking for inactive conversations at {current_time}")
@@ -905,6 +929,13 @@ def sms_reply():
 
     try:
         tenant_data = TENANTS[tenant_key]
+        # Fetch transactions for financial queries (balance, statement, etc.)
+        if any(keyword in message.lower() for keyword in ["balance", "pay", "due", "payment history", "last payment", "recent transactions", "last month", "rent charge", "statement", "charge for"]):
+            transactions, last_payment_date = fetch_tenant_transactions(tenant_key[0])
+            if transactions is not None:
+                tenant_data["transactions"] = transactions
+            if last_payment_date is not None:
+                tenant_data["last_payment_date"] = last_payment_date
     except Exception as e:
         logger.error(f"Error accessing tenant data for {from_number} with tenant_key {tenant_key}: {str(e)}")
         if conversation_language == "es":
