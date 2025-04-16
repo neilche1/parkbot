@@ -51,7 +51,7 @@ RENT_MANAGER_API_TOKEN = None
 MAINTENANCE_REQUESTS = []
 CALL_LOGS = []
 PENDING_IDENTIFICATION = {}
-CURRENT_CONVERSATIONS = {}  # Maps phone_number to {"tenant_key": (tenant_id, first_name, last_name, unit), "last_message_time": datetime, "pending_end": bool, "pending_identification": bool, "language": str, "message_history": deque}
+CURRENT_CONVERSATIONS = {}  # Maps phone_number to {"tenant_key": (tenant_id, first_name, last_name, unit), "last_message_time": datetime, "pending_end": bool, "pending_identification": bool, "language": str, "initial_language": str, "message_history": deque}
 
 # File path for storing CURRENT_CONVERSATIONS
 CONVERSATIONS_FILE = "current_conversations.json"
@@ -95,6 +95,7 @@ def save_conversations():
                 "pending_end": conversation["pending_end"],
                 "pending_identification": conversation.get("pending_identification", False),
                 "language": conversation.get("language", "en"),
+                "initial_language": conversation.get("initial_language", "en"),
                 "message_history": list(conversation["message_history"])  # Convert deque to list
             }
             if "pending_end_time" in conversation and conversation["pending_end_time"]:
@@ -753,7 +754,7 @@ def check_inactive_conversations():
         time_delta = (current_time - last_message_time).total_seconds() / 60.0
         logger.info(f"Conversation for {phone_number}: Last message at {last_message_time}, Time delta: {time_delta:.2f} minutes")
 
-        language = conversation.get("language", "en")
+        language = conversation.get("initial_language", "en")  # Use initial_language
         if language == "es":
             inactivity_message = "Ha pasado un tiempo desde tu último mensaje. ¿Hay algo más en lo que pueda ayudarte? Si no, cerraré esta conversación."
             closure_message = "No he recibido respuesta. He cerrado esta conversación. Si necesitas más ayuda, no dudes en contactarme."
@@ -761,7 +762,7 @@ def check_inactive_conversations():
             inactivity_message = "It’s been a while since your last message. Is there anything else I can assist you with? If not, I’ll close this conversation."
             closure_message = "No response received. I’ve closed this conversation. Feel free to reach out if you need further assistance."
 
-        if time_delta >= 3 and not conversation.get("pending_end", False):
+        if time_delta >= 5 and not conversation.get("pending_end", False):  # Reduced to 5 minutes
             conversation["pending_end"] = True
             conversation["pending_end_time"] = current_time
             send_sms(phone_number, inactivity_message)
@@ -777,7 +778,7 @@ def check_inactive_conversations():
 
     for phone_number in conversations_to_close:
         if phone_number in CURRENT_CONVERSATIONS:
-            language = CURRENT_CONVERSATIONS[phone_number].get("language", "en")
+            language = CURRENT_CONVERSATIONS[phone_number].get("initial_language", "en")
             if language == "es":
                 closure_message = "No he recibido respuesta. He cerrado esta conversación. Si necesitas más ayuda, no dudes en contactarme."
             else:
@@ -798,41 +799,15 @@ def sms_reply():
     message = request.values.get("Body").strip()
     logger.info(f"From: {from_number}, Message: {message}")
 
-    # Detect the language of the incoming message
-    try:
-        language = langdetect.detect(message)
-    except Exception as e:
-        logger.warning(f"Language detection failed for message '{message}': {str(e)}. Defaulting to English.")
-        language = "en"
-
-    # Update last message time for active conversations, with a safeguard for stale conversations
+    # Detect the language of the incoming message only for the first message
     current_time = datetime.datetime.now()
-    if from_number in CURRENT_CONVERSATIONS:
-        last_message_time = CURRENT_CONVERSATIONS[from_number]["last_message_time"]
-        time_delta = (current_time - last_message_time).total_seconds() / 3600.0  # Time in hours
-        # If the conversation is older than 1 hour, treat it as stale and reset it
-        if time_delta > 1:
-            logger.info(f"Conversation for {from_number} is stale (inactive for {time_delta:.2f} hours). Resetting conversation.")
-            del CURRENT_CONVERSATIONS[from_number]
-            if from_number in PENDING_IDENTIFICATION:
-                del PENDING_IDENTIFICATION[from_number]
-            save_conversations()
-        else:
-            CURRENT_CONVERSATIONS[from_number]["last_message_time"] = current_time
-            CURRENT_CONVERSATIONS[from_number]["language"] = language
-            # Reset pending end if tenant responds
-            if CURRENT_CONVERSATIONS[from_number].get("pending_end", False):
-                CURRENT_CONVERSATIONS[from_number]["pending_end"] = False
-                if "pending_end_time" in CURRENT_CONVERSATIONS[from_number]:
-                    del CURRENT_CONVERSATIONS[from_number]["pending_end_time"]
-            # Add the user's message to history
-            CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "user", "content": message})
-            logger.info(f"Updated last message time for {from_number}")
-            save_conversations()
-
-    # Always prompt for identification if not in an active conversation
     if from_number not in CURRENT_CONVERSATIONS:
-        # Start a new conversation, add to both PENDING_IDENTIFICATION and CURRENT_CONVERSATIONS
+        try:
+            language = langdetect.detect(message)
+        except Exception as e:
+            logger.warning(f"Language detection failed for message '{message}': {str(e)}. Defaulting to English.")
+            language = "en"
+        # Start a new conversation, set initial_language
         PENDING_IDENTIFICATION[from_number] = {"state": "awaiting_identification", "pending_message": message}
         CURRENT_CONVERSATIONS[from_number] = {
             "tenant_key": None,
@@ -840,6 +815,7 @@ def sms_reply():
             "pending_end": False,
             "pending_identification": True,
             "language": language,
+            "initial_language": language,  # Lock the initial language
             "message_history": deque(maxlen=5)  # Initialize message history
         }
         # Add the user's message to history
@@ -854,8 +830,58 @@ def sms_reply():
         save_conversations()
         return "OK"
 
-    # Get the conversation language and message history
-    conversation_language = CURRENT_CONVERSATIONS[from_number].get("language", "en")
+    # Update last message time for active conversations, with a safeguard for stale conversations
+    if from_number in CURRENT_CONVERSATIONS:
+        last_message_time = CURRENT_CONVERSATIONS[from_number]["last_message_time"]
+        time_delta = (current_time - last_message_time).total_seconds() / 60.0  # Time in minutes
+        # If the conversation is older than 5 minutes, treat it as stale and reset it
+        if time_delta > 5:
+            logger.info(f"Conversation for {from_number} is stale (inactive for {time_delta:.2f} minutes). Resetting conversation.")
+            del CURRENT_CONVERSATIONS[from_number]
+            if from_number in PENDING_IDENTIFICATION:
+                del PENDING_IDENTIFICATION[from_number]
+            save_conversations()
+            # Start a new conversation
+            try:
+                language = langdetect.detect(message)
+            except Exception as e:
+                logger.warning(f"Language detection failed for message '{message}': {str(e)}. Defaulting to English.")
+                language = "en"
+            PENDING_IDENTIFICATION[from_number] = {"state": "awaiting_identification", "pending_message": message}
+            CURRENT_CONVERSATIONS[from_number] = {
+                "tenant_key": None,
+                "last_message_time": current_time,
+                "pending_end": False,
+                "pending_identification": True,
+                "language": language,
+                "initial_language": language,
+                "message_history": deque(maxlen=5)
+            }
+            CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "user", "content": message})
+            save_conversations()
+            if language == "es":
+                identification_prompt = "Por favor, identifícate con tu nombre, apellido o número de unidad (por ejemplo, Juan Pérez, Unidad 5)."
+            else:
+                identification_prompt = "Please identify yourself with your first name, last name, or unit number (e.g., John Doe, Unit 5)."
+            send_sms(from_number, identification_prompt)
+            CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": identification_prompt})
+            save_conversations()
+            return "OK"
+        else:
+            CURRENT_CONVERSATIONS[from_number]["last_message_time"] = current_time
+            # Do not update language; use initial_language
+            # Reset pending end if tenant responds
+            if CURRENT_CONVERSATIONS[from_number].get("pending_end", False):
+                CURRENT_CONVERSATIONS[from_number]["pending_end"] = False
+                if "pending_end_time" in CURRENT_CONVERSATIONS[from_number]:
+                    del CURRENT_CONVERSATIONS[from_number]["pending_end_time"]
+            # Add the user's message to history
+            CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "user", "content": message})
+            logger.info(f"Updated last message time for {from_number}")
+            save_conversations()
+
+    # Use the initial_language for the conversation
+    conversation_language = CURRENT_CONVERSATIONS[from_number].get("initial_language", "en")
     message_history = CURRENT_CONVERSATIONS[from_number]["message_history"]
 
     # Check if the conversation is still in the identification phase
@@ -960,6 +986,50 @@ def sms_reply():
     tenant_key = CURRENT_CONVERSATIONS[from_number]["tenant_key"]
     logger.info(f"Accessing tenant_key for {from_number}: {tenant_key} (type: {type(tenant_key)})")
     tenant_data = TENANTS[tenant_key]
+
+    # Check if the message contains a name that conflicts with the identified tenant
+    input_name = " ".join(message_lower.split()).strip()
+    current_first_name = tenant_key[1].lower()
+    current_last_name = tenant_key[2].lower()
+    current_full_name = f"{current_first_name} {current_last_name}".strip()
+    # Simple check for a name in the message (e.g., "I'm Zenobia", "Hi I'm John")
+    if ("i'm" in message_lower or "i am" in message_lower) and len(input_name.split()) >= 2:
+        # Extract the name after "I'm" or "I am"
+        name_part = message_lower.split("i'm")[-1] if "i'm" in message_lower else message_lower.split("i am")[-1]
+        name_part = " ".join(name_part.split()).strip()
+        if name_part and name_part != current_first_name and name_part != current_last_name and name_part != current_full_name:
+            logger.info(f"Name mismatch detected for {from_number}. Current tenant: {current_full_name}, Provided name: {name_part}. Resetting conversation.")
+            # Reset the conversation
+            del CURRENT_CONVERSATIONS[from_number]
+            if from_number in PENDING_IDENTIFICATION:
+                del PENDING_IDENTIFICATION[from_number]
+            save_conversations()
+            # Start a new conversation
+            try:
+                language = langdetect.detect(message)
+            except Exception as e:
+                logger.warning(f"Language detection failed for message '{message}': {str(e)}. Defaulting to English.")
+                language = "en"
+            PENDING_IDENTIFICATION[from_number] = {"state": "awaiting_identification", "pending_message": message}
+            CURRENT_CONVERSATIONS[from_number] = {
+                "tenant_key": None,
+                "last_message_time": current_time,
+                "pending_end": False,
+                "pending_identification": True,
+                "language": language,
+                "initial_language": language,
+                "message_history": deque(maxlen=5)
+            }
+            CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "user", "content": message})
+            save_conversations()
+            if language == "es":
+                identification_prompt = "Por favor, identifícate con tu nombre, apellido o número de unidad (por ejemplo, Juan Pérez, Unidad 5)."
+            else:
+                identification_prompt = "Please identify yourself with your first name, last name, or unit number (e.g., John Doe, Unit 5)."
+            send_sms(from_number, identification_prompt)
+            CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": identification_prompt})
+            save_conversations()
+            return "OK"
 
     # Fetch transaction data if needed for financial queries
     needs_transactions = (
