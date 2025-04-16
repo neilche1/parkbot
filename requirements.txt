@@ -7,3 +7,4 @@ requests==2.32.3
 tenacity==8.5.0
 fuzzywuzzy==0.18.0
 python-Levenshtein==0.25.1
+langdetect==1.0.9
