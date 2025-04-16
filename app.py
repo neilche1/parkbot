@@ -10,6 +10,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from fuzzywuzzy import fuzz
 import logging
 import langdetect
+from collections import deque
 
 app = Flask(__name__)
 
@@ -50,7 +51,7 @@ RENT_MANAGER_API_TOKEN = None
 MAINTENANCE_REQUESTS = []
 CALL_LOGS = []
 PENDING_IDENTIFICATION = {}
-CURRENT_CONVERSATIONS = {}  # Maps phone_number to {"tenant_key": (tenant_id, first_name, last_name, unit), "last_message_time": datetime, "pending_end": bool, "pending_identification": bool, "language": str}
+CURRENT_CONVERSATIONS = {}  # Maps phone_number to {"tenant_key": (tenant_id, first_name, last_name, unit), "last_message_time": datetime, "pending_end": bool, "pending_identification": bool, "language": str, "message_history": deque}
 
 # File path for storing CURRENT_CONVERSATIONS
 CONVERSATIONS_FILE = "current_conversations.json"
@@ -71,6 +72,8 @@ def load_conversations():
                     if "tenant_key" in conversation and conversation["tenant_key"] is not None:
                         if isinstance(conversation["tenant_key"], list):
                             conversation["tenant_key"] = tuple(conversation["tenant_key"])
+                    # Initialize message_history as a deque with max length 5
+                    conversation["message_history"] = deque(conversation.get("message_history", []), maxlen=5)
                 CURRENT_CONVERSATIONS = data
                 logger.info("Loaded CURRENT_CONVERSATIONS from file")
         else:
@@ -83,7 +86,7 @@ def load_conversations():
 # Save CURRENT_CONVERSATIONS to file
 def save_conversations():
     try:
-        # Convert datetime objects to strings for JSON serialization
+        # Convert datetime objects to strings and deque to list for JSON serialization
         data = {}
         for phone_number, conversation in CURRENT_CONVERSATIONS.items():
             data[phone_number] = {
@@ -91,7 +94,8 @@ def save_conversations():
                 "last_message_time": conversation["last_message_time"].isoformat(),
                 "pending_end": conversation["pending_end"],
                 "pending_identification": conversation.get("pending_identification", False),
-                "language": conversation.get("language", "en")
+                "language": conversation.get("language", "en"),
+                "message_history": list(conversation["message_history"])  # Convert deque to list
             }
             if "pending_end_time" in conversation and conversation["pending_end_time"]:
                 data[phone_number]["pending_end_time"] = conversation["pending_end_time"].isoformat()
@@ -529,7 +533,7 @@ def identify_tenant(input_text):
         logger.info("No matches found")
         return None, None  # No match
 
-def get_ai_response(user_input, tenant_data, is_maintenance_request=False, include_transactions=True):
+def get_ai_response(user_input, tenant_data, conversation_language, message_history=None, is_maintenance_request=False, include_transactions=True, check_for_end=False):
     start_time = datetime.datetime.now()
     
     # Include the full tenant_data and park_details in the prompt (no exclusions)
@@ -551,18 +555,19 @@ def get_ai_response(user_input, tenant_data, is_maintenance_request=False, inclu
         del tenant_data_copy["transactions"]
     
     # Estimate input token count more accurately
-    # Approximate tokens: 1 character ~ 0.25 tokens (rough estimate for English text)
     transaction_str = json.dumps(transactions)
     tenant_data_str = json.dumps(tenant_data_copy)
     park_details_str = json.dumps(park_details)
     user_input_str = user_input
-    transaction_tokens = len(transaction_str) * 0.25  # ~0.25 tokens per character
+    message_history_str = json.dumps(list(message_history)) if message_history else "[]"
+    transaction_tokens = len(transaction_str) * 0.25
     tenant_data_tokens = len(tenant_data_str) * 0.25
     park_details_tokens = len(park_details_str) * 0.25
     user_input_tokens = len(user_input_str) * 0.25
-    total_input_tokens = transaction_tokens + tenant_data_tokens + park_details_tokens + user_input_tokens
+    message_history_tokens = len(message_history_str) * 0.25
+    total_input_tokens = transaction_tokens + tenant_data_tokens + park_details_tokens + user_input_tokens + message_history_tokens
     logger.info(f"Sending {len(transactions)} transactions to xAI API for tenant {tenant_data.get('tenant_id', 'Unknown')}. Estimated input tokens: {total_input_tokens:.0f}")
-    logger.debug(f"Transaction string length: {len(transaction_str)}, Tenant data string length: {len(tenant_data_str)}, Park details string length: {len(park_details_str)}, User input length: {len(user_input_str)}")
+    logger.debug(f"Transaction string length: {len(transaction_str)}, Tenant data string length: {len(tenant_data_str)}, Park details string length: {len(park_details_str)}, User input length: {len(user_input_str)}, Message history length: {len(message_history_str)}")
     
     # Calculate the monthly rent charge based on transaction history
     monthly_rent_charge = None
@@ -571,48 +576,62 @@ def get_ai_response(user_input, tenant_data, is_maintenance_request=False, inclu
             if "rent" in transaction.get("Comment", "").lower() and transaction.get("TransactionType") != "Payment":
                 monthly_rent_charge = float(transaction.get("Amount", 0.00))
                 break
-    # Construct the prompt, handling the case where monthly_rent_charge is None
     rent_charge_str = f"${monthly_rent_charge:.2f}" if monthly_rent_charge is not None else "unknown"
+    
+    # Construct the prompt
     prompt = (
         f"Tenant data: {tenant_data_copy}. "
         f"Tenant is from park: {park_details}. "
         f"All transactions: {transactions}. "
         f"Monthly rent charge (if available): {rent_charge_str}. "
+        f"Conversation language: {conversation_language}. "
+        f"Conversation history (last 5 messages, format [{{'role': 'user' or 'bot', 'content': message}}]): {message_history_str}. "
         f"Query: {user_input}"
     )
     prompt_length = len(prompt)
     logger.debug(f"Prompt length: {prompt_length} characters")
     
     @retry(
-        stop=stop_after_attempt(2),  # Retry up to 2 times
-        wait=wait_exponential(multiplier=1, min=3, max=6),  # Exponential backoff: 3s, 6s
-        retry=retry_if_exception_type(Exception)  # Retry on any exception
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=3, max=6),
+        retry=retry_if_exception_type(Exception)
     )
     def call_xai():
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {XAI_API_KEY}"
         }
+        system_prompt = (
+            "You are a professional mobile home park manager assisting tenants across multiple mobile home parks. "
+            "Respond in a natural, conversational tone as a human would, without explicitly stating your role. "
+            "Ensure responses flow seamlessly as part of an ongoing conversation, avoiding repetitive greetings like 'Hey there' after the initial message. "
+            "Provide concise, actionable responses tailored to the tenant’s specific park, provided as 'Tenant is from park: {park_details}'. "
+            "Use the tenant's full transaction history ('All transactions: {transactions}') for payment-related queries. "
+            "For financial queries (e.g., balance, rent charge, payment history), use the tenant's balance, due date, monthly rent charge, and transaction history. "
+            "For example, if asked 'What did I pay last month?', calculate the total payments made last month from the transaction history. "
+            "If asked about the rent charge, use the 'Monthly rent charge' if available, or infer from transaction history. "
+            "For payment policies, state that tenants can be evicted for not paying utilities or other fees, as non-payment of any charges can lead to eviction. "
+            "Do not suggest payment plans; encourage immediate payment or direct to the park office. "
+            "For maintenance requests, confirm the issue is logged, the owner is notified, and provide a next step (e.g., scheduling a repair). "
+            "For other queries, respond using park-specific details (e.g., payment_methods, payment_procedure, payee). "
+            "Respond in the language specified by 'Conversation language' ('es' for Spanish, 'en' for English). "
+            "If lacking details, respond with: 'I’m sorry, I don’t have that information. Please contact the park office at (504) 313-0024, available Monday to Friday, 9 AM to 5 PM, for more details.' (in English) or 'Lo siento, no tengo esa información. Por favor, contacta a la oficina del parque al (504) 313-0024, disponible de lunes a viernes, de 9 AM a 5 PM, para más detalles.' (in Spanish). "
+            "Do not make up information. "
+        )
+        if check_for_end:
+            system_prompt += (
+                "Based on the conversation history and the current query, determine if the tenant intends to end the conversation. "
+                "If the tenant wants to end, respond with 'END_CONVERSATION'. Otherwise, respond with 'CONTINUE'."
+            )
+        else:
+            system_prompt += (
+                "Provide a helpful response to the tenant’s query, considering the conversation history for context."
+            )
         payload = {
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "You are a professional mobile home park manager assisting tenants across multiple mobile home parks. "
-                        "Respond in a natural, conversational tone as a human would, without explicitly stating your role. "
-                        "Ensure responses flow seamlessly as part of an ongoing conversation, avoiding repetitive greetings like 'Hey there' after the initial message. "
-                        "Provide concise, actionable responses tailored to the tenant’s specific park, which will be provided in the prompt as 'Tenant is from park: {park_details}'. "
-                        "Use the tenant's full transaction history, provided as 'All transactions: {transactions}', to inform your responses when relevant, such as for payment-related queries. "
-                        "For financial queries (e.g., balance, rent charge, payment history), use the tenant's balance, due date, monthly rent charge, and transaction history to provide accurate and context-aware answers. "
-                        "For example, if asked 'What did I pay last month?', calculate the total payments made in the previous month from the transaction history and respond accordingly. "
-                        "If asked about the rent charge, use the 'Monthly rent charge' provided in the prompt if available, or infer it from the transaction history if possible. "
-                        "For queries about payment policies, clearly state that at this park, tenants can be evicted for paying only their rent and not paying utilities or other fees, as non-payment of any charges can lead to eviction. "
-                        "Do not suggest or offer payment plans, as they are not allowed at this park; instead, encourage immediate payment or direct the tenant to contact the park office for further assistance. "
-                        "For maintenance requests, confirm the issue has been logged, the owner has been notified, and provide a clear next step (e.g., scheduling a repair). "
-                        "For other queries, respond helpfully and professionally using the park-specific details provided (e.g., payment_methods, payment_procedure, payee). "
-                        "Do not make up information (e.g., addresses, procedures, or any details not explicitly provided). "
-                        "If you lack specific details to answer a query, respond with: 'I’m sorry, I don’t have that information. Please contact the park office at (504) 313-0024, available Monday to Friday, 9 AM to 5 PM, for more details.'"
-                    )
+                    "content": system_prompt
                 },
                 {
                     "role": "user",
@@ -641,30 +660,36 @@ def get_ai_response(user_input, tenant_data, is_maintenance_request=False, inclu
             raise Exception(error_message)
 
     try:
-        # Note: DeepSearch mode requires user activation via UI
         if include_transactions:
             logger.info("Using standard API call for financial query (consider enabling DeepSearch mode via UI for faster responses)")
         else:
             logger.info("Using standard API call (DeepSearch mode requires user activation via UI)")
         response = call_xai()
-        # Extract the response content from the xAI API response
         end_time = datetime.datetime.now()
         logger.info(f"get_ai_response completed in {(end_time - start_time).total_seconds() * 1000:.2f} ms")
         return response["choices"][0]["message"]["content"].strip()
     except Exception as e:
         logger.error(f"Error in get_ai_response after retries: {str(e)}")
-        # If the query is financial, provide a basic fallback response using available data
+        if check_for_end:
+            return "CONTINUE"  # Default to continuing if intent check fails
         if any(keyword in user_input.lower() for keyword in ["balance", "pay", "due", "payment history", "last payment", "recent transactions", "last month", "rent charge"]):
-            return f"I couldn’t process your request fully, but I can tell you that your current balance is {tenant_data['balance']}, due on the {tenant_data['due_date']} of each month. For more details, please try again later or contact the park office at {PARK_OFFICE_PHONE}, available {PARK_OFFICE_HOURS}."
+            if conversation_language == "es":
+                return f"No pude procesar tu solicitud por completo, pero puedo decirte que tu saldo actual es {tenant_data['balance']}, con vencimiento el {tenant_data['due_date']} de cada mes. Para más detalles, intenta de nuevo más tarde o contacta a la oficina del parque al {PARK_OFFICE_PHONE}, disponible {PARK_OFFICE_HOURS}."
+            else:
+                return f"I couldn’t process your request fully, but I can tell you that your current balance is {tenant_data['balance']}, due on the {tenant_data['due_date']} of each month. For more details, please try again later or contact the park office at {PARK_OFFICE_PHONE}, available {PARK_OFFICE_HOURS}."
         elif is_maintenance_request:
-            return "I’m sorry to hear about your issue. I’ve logged your request and notified the owner. The maintenance team will contact you soon to schedule a repair."
+            if conversation_language == "es":
+                return "Lamento escuchar sobre tu problema. He registrado tu solicitud y he notificado al propietario. El equipo de mantenimiento te contactará pronto para programar una reparación."
+            else:
+                return "I’m sorry to hear about your issue. I’ve logged your request and notified the owner. The maintenance team will contact you soon to schedule a repair."
         else:
-            return f"I’m sorry, I couldn’t process your request at this time. Please try again later or contact the park office at {PARK_OFFICE_PHONE}, available {PARK_OFFICE_HOURS}."
+            if conversation_language == "es":
+                return f"Lo siento, no pude procesar tu solicitud en este momento. Por favor, intenta de nuevo más tarde o contacta a la oficina del parque al {PARK_OFFICE_PHONE}, disponible {PARK_OFFICE_HOURS}."
+            else:
+                return f"I’m sorry, I couldn’t process your request at this time. Please try again later or contact the park office at {PARK_OFFICE_PHONE}, available {PARK_OFFICE_HOURS}."
 
 def send_sms(to_number, message):
-    # No redirection; send directly to the specified number
     recipient = to_number
-
     logger.info(f"Preparing to send SMS to {recipient}: {message}")
     logger.debug(f"TWILIO_SID: {TWILIO_SID}")
     logger.debug(f"TWILIO_TOKEN: {TWILIO_TOKEN}")
@@ -713,23 +738,19 @@ def refresh_tenants():
 # Endpoint to check for inactive conversations (to be called by a cron job)
 @app.route("/check_inactive_conversations", methods=["GET"])
 def check_inactive_conversations():
-    # Load the latest conversations from file
     load_conversations()
-
     current_time = datetime.datetime.now()
     conversations_to_close = []
     
     logger.info(f"Checking for inactive conversations at {current_time}")
     for phone_number, conversation in list(CURRENT_CONVERSATIONS.items()):
-        # Skip if the conversation is not active (e.g., no last_message_time)
         if "last_message_time" not in conversation:
             logger.info(f"Skipping conversation for {phone_number}: No last_message_time")
             continue
         last_message_time = conversation["last_message_time"]
-        time_delta = (current_time - last_message_time).total_seconds() / 60.0  # Time in minutes
+        time_delta = (current_time - last_message_time).total_seconds() / 60.0
         logger.info(f"Conversation for {phone_number}: Last message at {last_message_time}, Time delta: {time_delta:.2f} minutes")
 
-        # Determine the language for timeout messages
         language = conversation.get("language", "en")
         if language == "es":
             inactivity_message = "Ha pasado un tiempo desde tu último mensaje. ¿Hay algo más en lo que pueda ayudarte? Si no, cerraré esta conversación."
@@ -738,15 +759,13 @@ def check_inactive_conversations():
             inactivity_message = "It’s been a while since your last message. Is there anything else I can assist you with? If not, I’ll close this conversation."
             closure_message = "No response received. I’ve closed this conversation. Feel free to reach out if you need further assistance."
 
-        # Check for 3-minute inactivity timeout
         if time_delta >= 3 and not conversation.get("pending_end", False):
             conversation["pending_end"] = True
             conversation["pending_end_time"] = current_time
             send_sms(phone_number, inactivity_message)
             logger.info(f"Inactivity timeout triggered for {phone_number} by cron job")
-            save_conversations()  # Save after modification
+            save_conversations()
 
-        # Check for 1-minute timeout after end prompt
         if conversation.get("pending_end", False):
             pending_end_time = conversation["pending_end_time"]
             end_delta = (current_time - pending_end_time).total_seconds() / 60.0
@@ -754,7 +773,6 @@ def check_inactive_conversations():
             if end_delta >= 1:
                 conversations_to_close.append(phone_number)
 
-    # Close conversations that have timed out
     for phone_number in conversations_to_close:
         if phone_number in CURRENT_CONVERSATIONS:
             language = CURRENT_CONVERSATIONS[phone_number].get("language", "en")
@@ -767,7 +785,7 @@ def check_inactive_conversations():
                 del PENDING_IDENTIFICATION[phone_number]
             send_sms(phone_number, closure_message)
             logger.info(f"Conversation closed for {phone_number} by cron job due to no response after end prompt")
-            save_conversations()  # Save after modification
+            save_conversations()
 
     return "Checked for inactive conversations"
 
@@ -796,7 +814,7 @@ def sms_reply():
             del CURRENT_CONVERSATIONS[from_number]
             if from_number in PENDING_IDENTIFICATION:
                 del PENDING_IDENTIFICATION[from_number]
-            save_conversations()  # Save after modification
+            save_conversations()
         else:
             CURRENT_CONVERSATIONS[from_number]["last_message_time"] = current_time
             CURRENT_CONVERSATIONS[from_number]["language"] = language
@@ -805,8 +823,10 @@ def sms_reply():
                 CURRENT_CONVERSATIONS[from_number]["pending_end"] = False
                 if "pending_end_time" in CURRENT_CONVERSATIONS[from_number]:
                     del CURRENT_CONVERSATIONS[from_number]["pending_end_time"]
+            # Add the user's message to history
+            CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "user", "content": message})
             logger.info(f"Updated last message time for {from_number}")
-            save_conversations()  # Save after modification
+            save_conversations()
 
     # Always prompt for identification if not in an active conversation
     if from_number not in CURRENT_CONVERSATIONS:
@@ -816,15 +836,25 @@ def sms_reply():
             "tenant_key": None,
             "last_message_time": current_time,
             "pending_end": False,
-            "pending_identification": True,  # Indicate this conversation is in identification phase
-            "language": language
+            "pending_identification": True,
+            "language": language,
+            "message_history": deque(maxlen=5)  # Initialize message history
         }
+        # Add the user's message to history
+        CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "user", "content": message})
         save_conversations()
         if language == "es":
-            send_sms(from_number, "Por favor, identifícate con tu nombre, apellido o número de unidad (por ejemplo, Juan Pérez, Unidad 5).")
+            identification_prompt = "Por favor, identifícate con tu nombre, apellido o número de unidad (por ejemplo, Juan Pérez, Unidad 5)."
         else:
-            send_sms(from_number, "Please identify yourself with your first name, last name, or unit number (e.g., John Doe, Unit 5).")
+            identification_prompt = "Please identify yourself with your first name, last name, or unit number (e.g., John Doe, Unit 5)."
+        send_sms(from_number, identification_prompt)
+        CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": identification_prompt})
+        save_conversations()
         return "OK"
+
+    # Get the conversation language and message history
+    conversation_language = CURRENT_CONVERSATIONS[from_number].get("language", "en")
+    message_history = CURRENT_CONVERSATIONS[from_number]["message_history"]
 
     # Check if the conversation is still in the identification phase
     if CURRENT_CONVERSATIONS[from_number].get("pending_identification", False):
@@ -832,29 +862,23 @@ def sms_reply():
         tenant_key, possible_matches = identify_tenant(message)
         if tenant_key:
             # Successfully identified
-            # Retrieve the pending message before deleting the entry
             if from_number in PENDING_IDENTIFICATION:
                 pending_message = PENDING_IDENTIFICATION[from_number].get("pending_message")
                 del PENDING_IDENTIFICATION[from_number]
             else:
                 pending_message = None
-            # Update the existing conversation entry
-            CURRENT_CONVERSATIONS[from_number] = {
-                "tenant_key": tenant_key,
-                "last_message_time": current_time,
-                "pending_end": False,
-                "pending_identification": False,  # Identification complete
-                "language": language
-            }
+            CURRENT_CONVERSATIONS[from_number]["tenant_key"] = tenant_key
+            CURRENT_CONVERSATIONS[from_number]["pending_identification"] = False
             logger.info(f"Tenant identified for {from_number}: {tenant_key}")
-            save_conversations()  # Save after adding new conversation
-            # Send the personalized greeting first (no follow-up question here)
+            save_conversations()
             park_name = TENANTS[tenant_key]["park"]["name"]
-            if language == "es":
-                send_sms(from_number, f"¡Hola {tenant_key[1]}! Te he identificado. ¿Cómo puedo ayudarte hoy con respecto a {park_name}?")
+            if conversation_language == "es":
+                greeting = f"¡Hola {tenant_key[1]}! Te he identificado. ¿Cómo puedo ayudarte hoy con respecto a {park_name}?"
             else:
-                send_sms(from_number, f"Hello {tenant_key[1]}! I’ve identified you. How can I assist you today regarding {park_name}?")
-            # Process the pending message only if it's substantive
+                greeting = f"Hello {tenant_key[1]}! I’ve identified you. How can I assist you today regarding {park_name}?"
+            send_sms(from_number, greeting)
+            CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": greeting})
+            save_conversations()
             if pending_message:
                 message_lower = pending_message.lower()
                 generic_greetings = ["hello", "hi", "hey", "greetings", "good morning", "good afternoon", "good evening", "hola", "buenos días", "buenas tardes", "buenas noches"]
@@ -862,7 +886,6 @@ def sms_reply():
                     logger.info(f"Skipping generic pending message: '{pending_message}'")
                 else:
                     tenant_data = TENANTS[tenant_key]
-                    # Fetch transactions if needed for the pending message
                     if ("balance" in message_lower or "pay" in message_lower or "due" in message_lower or
                         "payment history" in message_lower or "last payment" in message_lower or
                         "recent transactions" in message_lower or "last month" in message_lower or
@@ -876,13 +899,15 @@ def sms_reply():
                                 TENANTS[tenant_key]["last_payment_date"] = last_payment_date
                                 tenant_data = TENANTS[tenant_key]
                             else:
-                                if language == "es":
-                                    send_sms(from_number, f"Lo siento, no pude recuperar tus datos de transacciones en este momento. Por favor, contacta a la oficina del parque al {PARK_OFFICE_PHONE}, disponible {PARK_OFFICE_HOURS}, para asistencia.")
+                                if conversation_language == "es":
+                                    error_msg = f"Lo siento, no pude recuperar tus datos de transacciones en este momento. Por favor, contacta a la oficina del parque al {PARK_OFFICE_PHONE}, disponible {PARK_OFFICE_HOURS}, para asistencia."
                                 else:
-                                    send_sms(from_number, f"I’m sorry, I couldn’t retrieve your transaction data at this time. Please contact the park office at {PARK_OFFICE_PHONE}, available {PARK_OFFICE_HOURS}, for assistance.")
+                                    error_msg = f"I’m sorry, I couldn’t retrieve your transaction data at this time. Please contact the park office at {PARK_OFFICE_PHONE}, available {PARK_OFFICE_HOURS}, for assistance."
+                                send_sms(from_number, error_msg)
+                                CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": error_msg})
+                                save_conversations()
                                 return "OK"
                     if "maintenance" in message_lower or "fix" in message_lower or "broken" in message_lower or "leak" in message_lower or "leaking" in message_lower or "flood" in message_lower or "damage" in message_lower or "repair" in message_lower or "clog" in message_lower or "power" in message_lower:
-                        # Log the maintenance request
                         tenant_name = f"{tenant_key[1]} {tenant_key[2]}"
                         tenant_lot = tenant_key[3]
                         MAINTENANCE_REQUESTS.append({
@@ -891,41 +916,40 @@ def sms_reply():
                             "tenant_lot": tenant_lot,
                             "issue": pending_message
                         })
-                        # Notify the owner (will be sent to OWNER_PHONE)
                         owner_message = f"Maintenance request from {tenant_name}, Unit {tenant_lot}: {pending_message}"
                         try:
                             send_sms(OWNER_PHONE, owner_message)
                         except Exception as e:
                             logger.error(f"Failed to notify owner for maintenance request from {tenant_name}: {str(e)}")
-                        # Generate an AI response for the tenant
-                        reply = get_ai_response(pending_message, tenant_data, is_maintenance_request=True, include_transactions=False)
-                        # Add park office contact and follow-up question for maintenance requests
-                        if language == "es":
+                        reply = get_ai_response(pending_message, tenant_data, conversation_language, message_history, is_maintenance_request=True, include_transactions=False)
+                        if conversation_language == "es":
                             reply += f" Para asistencia inmediata, puedes contactar a la oficina del parque al {PARK_OFFICE_PHONE}, disponible {PARK_OFFICE_HOURS}. ¿Hay algo más con lo que pueda ayudarte?"
                         else:
                             reply += f" For immediate assistance, you can contact the park office at {PARK_OFFICE_PHONE}, available {PARK_OFFICE_HOURS}. Is there anything else I can assist you with?"
                         send_sms(from_number, reply)
+                        CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": reply})
                     else:
-                        reply = get_ai_response(pending_message, tenant_data, include_transactions=False)
+                        reply = get_ai_response(pending_message, tenant_data, conversation_language, message_history, include_transactions=False)
                         send_sms(from_number, reply)
+                        CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": reply})
+                    save_conversations()
             return "OK"
         else:
-            # Handle ambiguous or no matches
             if possible_matches:
-                # Multiple matches found; prompt for more specific information without listing names
-                if language == "es":
-                    send_sms(from_number, f"Encontré varios inquilinos que coinciden con '{message}'. Por favor, proporciona más detalles, como tu nombre completo o número de unidad, para identificarte.")
+                if conversation_language == "es":
+                    disambig_msg = f"Encontré varios inquilinos que coinciden con '{message}'. Por favor, proporciona más detalles, como tu nombre completo o número de unidad, para identificarte."
                 else:
-                    send_sms(from_number, f"I found multiple tenants matching '{message}'. Please provide more details, such as your full name or unit number, to identify yourself.")
+                    disambig_msg = f"I found multiple tenants matching '{message}'. Please provide more details, such as your full name or unit number, to identify yourself."
+                send_sms(from_number, disambig_msg)
+                CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": disambig_msg})
             else:
-                # No matches found
-                if language == "es":
-                    send_sms(from_number, "No pude identificarte con la información proporcionada. Por favor, intenta de nuevo con tu nombre, apellido o número de unidad (por ejemplo, Juan Pérez, Unidad 5).")
+                if conversation_language == "es":
+                    no_match_msg = "No pude identificarte con la información proporcionada. Por favor, intenta de nuevo con tu nombre, apellido o número de unidad (por ejemplo, Juan Pérez, Unidad 5)."
                 else:
-                    send_sms(from_number, "I couldn’t identify you with the information provided. Please try again with your first name, last name, or unit number (e.g., John Doe, Unit 5).")
-            # Update the last message time even if identification fails
+                    no_match_msg = "I couldn’t identify you with the information provided. Please try again with your first name, last name, or unit number (e.g., John Doe, Unit 5)."
+                send_sms(from_number, no_match_msg)
+                CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": no_match_msg})
             CURRENT_CONVERSATIONS[from_number]["last_message_time"] = current_time
-            CURRENT_CONVERSATIONS[from_number]["language"] = language
             save_conversations()
             return "OK"
 
@@ -935,55 +959,35 @@ def sms_reply():
     logger.info(f"Accessing tenant_key for {from_number}: {tenant_key} (type: {type(tenant_key)})")
     tenant_data = TENANTS[tenant_key]
 
-    # Check if the tenant wants to end the conversation (prioritize this check)
-    end_conversation_phrases = ["no", "nope", "that's all", "that's it", "goodbye", "bye", "done", "i'm done", "nevermind", "no gracias", "adiós", "listo", "terminé"]
-    # Check if any end phrase is a substring of the message
-    if any(phrase in message_lower for phrase in end_conversation_phrases):
-        del CURRENT_CONVERSATIONS[from_number]
-        if from_number in PENDING_IDENTIFICATION:
-            del PENDING_IDENTIFICATION[from_number]
-        save_conversations()  # Save after removing conversation
-        if language == "es":
-            send_sms(from_number, "¡Adiós! Si necesitas más ayuda, no dudes en contactarme.")
-        else:
-            send_sms(from_number, "Goodbye! Feel free to reach out if you need further assistance.")
-        logger.info(f"Conversation ended for {from_number}")
-        return "OK"
-
-    # Fetch transaction data if needed for financial queries, but only if not already fetched
+    # Fetch transaction data if needed for financial queries
     needs_transactions = (
-        "balance" in message_lower or
-        "pay" in message_lower or
-        "due" in message_lower or
-        "payment history" in message_lower or
-        "last payment" in message_lower or
-        "recent transactions" in message_lower or
-        "last month" in message_lower or
-        "why is my balance" in message_lower or
-        "statement" in message_lower or
+        "balance" in message_lower or "pay" in message_lower or "due" in message_lower or
+        "payment history" in message_lower or "last payment" in message_lower or
+        "recent transactions" in message_lower or "last month" in message_lower or
+        "why is my balance" in message_lower or "statement" in message_lower or
         "rent charge" in message_lower
     )
     if needs_transactions and tenant_data["transactions"] is None:
-        tenant_id = tenant_key[0]  # Extract TenantID from tenant_key
+        tenant_id = tenant_key[0]
         transactions, last_payment_date = fetch_tenant_transactions(tenant_id)
         if transactions is not None:
-            # Update the TENANTS dictionary with the fetched transactions
             TENANTS[tenant_key]["transactions"] = transactions
             TENANTS[tenant_key]["last_payment_date"] = last_payment_date
-            tenant_data = TENANTS[tenant_key]  # Refresh tenant_data with updated info
+            tenant_data = TENANTS[tenant_key]
         else:
-            # Handle the case where fetching transactions fails
-            if language == "es":
-                send_sms(from_number, f"Lo siento, no pude recuperar tus datos de transacciones en este momento. Por favor, contacta a la oficina del parque al {PARK_OFFICE_PHONE}, disponible {PARK_OFFICE_HOURS}, para asistencia.")
+            if conversation_language == "es":
+                error_msg = f"Lo siento, no pude recuperar tus datos de transacciones en este momento. Por favor, contacta a la oficina del parque al {PARK_OFFICE_PHONE}, disponible {PARK_OFFICE_HOURS}, para asistencia."
             else:
-                send_sms(from_number, f"I’m sorry, I couldn’t retrieve your transaction data at this time. Please contact the park office at {PARK_OFFICE_PHONE}, available {PARK_OFFICE_HOURS}, for assistance.")
+                error_msg = f"I’m sorry, I couldn’t retrieve your transaction data at this time. Please contact the park office at {PARK_OFFICE_PHONE}, available {PARK_OFFICE_HOURS}, for assistance."
+            send_sms(from_number, error_msg)
+            CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": error_msg})
+            save_conversations()
             return "OK"
     elif needs_transactions:
         logger.info(f"Transactions already fetched for TenantID={tenant_key[0]}. Skipping redundant fetch.")
 
     # Handle the tenant's query
     if "maintenance" in message_lower or "fix" in message_lower or "broken" in message_lower or "leak" in message_lower or "leaking" in message_lower or "flood" in message_lower or "damage" in message_lower or "repair" in message_lower or "clog" in message_lower or "power" in message_lower:
-        # Log the maintenance request
         tenant_name = f"{tenant_key[1]} {tenant_key[2]}"
         tenant_lot = tenant_key[3]
         MAINTENANCE_REQUESTS.append({
@@ -992,67 +996,85 @@ def sms_reply():
             "tenant_lot": tenant_lot,
             "issue": message
         })
-        # Notify the owner (will be sent to OWNER_PHONE)
         owner_message = f"Maintenance request from {tenant_name}, Unit {tenant_lot}: {message}"
         try:
             send_sms(OWNER_PHONE, owner_message)
         except Exception as e:
             logger.error(f"Failed to notify owner for maintenance request from {tenant_name}: {str(e)}")
-        # Generate an AI response for the tenant
-        reply = get_ai_response(message, tenant_data, is_maintenance_request=True, include_transactions=False)
-        # Add park office contact and follow-up question for maintenance requests
-        if language == "es":
+        reply = get_ai_response(message, tenant_data, conversation_language, message_history, is_maintenance_request=True, include_transactions=False)
+        if conversation_language == "es":
             reply += f" Para asistencia inmediata, puedes contactar a la oficina del parque al {PARK_OFFICE_PHONE}, disponible {PARK_OFFICE_HOURS}. ¿Hay algo más con lo que pueda ayudarte?"
         else:
             reply += f" For immediate assistance, you can contact the park office at {PARK_OFFICE_PHONE}, available {PARK_OFFICE_HOURS}. Is there anything else I can assist you with?"
         send_sms(from_number, reply)
+        CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": reply})
     elif "address" in message_lower:
         address = tenant_data['address']
         full_address = f"{address['street']}, {address['city']}, {address['state']} {address['postal_code']}"
-        if language == "es":
+        if conversation_language == "es":
             reply = f"Tu dirección principal registrada es {full_address}. ¿Hay algo más con lo que pueda ayudarte?"
         else:
             reply = f"Your primary address on file is {full_address}. Is there anything else I can assist you with?"
         send_sms(from_number, reply)
+        CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": reply})
     elif "unit" in message_lower or "lot" in message_lower:
-        if language == "es":
+        if conversation_language == "es":
             reply = f"Tu número de unidad es {tenant_key[3]}. ¿Hay algo más con lo que pueda ayudarte?"
         else:
             reply = f"Your unit number is {tenant_key[3]}. Is there anything else I can assist you with?"
         send_sms(from_number, reply)
+        CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": reply})
     elif "move in" in message_lower or "move-in" in message_lower:
         move_in_date = tenant_data['move_in_date']
         if move_in_date != "Unknown":
-            # Parse the date and format it nicely
             try:
                 date_obj = datetime.datetime.strptime(move_in_date, "%Y-%m-%dT%H:%M:%S")
-                if language == "es":
+                if conversation_language == "es":
                     formatted_date = date_obj.strftime("%d de %B de %Y")
                     reply = f"Tu fecha de mudanza fue el {formatted_date}. Si necesitas más información, ¡no dudes en preguntar! ¿Hay algo más con lo que pueda ayudarte?"
                 else:
                     formatted_date = date_obj.strftime("%B %d, %Y")
                     reply = f"Your move-in date was {formatted_date}. If you need any more information, feel free to ask! Is there anything else I can assist you with?"
             except ValueError:
-                if language == "es":
+                if conversation_language == "es":
                     reply = f"Lo siento, no pude determinar tu fecha de mudanza. Por favor, contacta a la oficina del parque al {PARK_OFFICE_PHONE}, disponible {PARK_OFFICE_HOURS}, para más detalles. ¿Hay algo más con lo que pueda ayudarte?"
                 else:
                     reply = f"I’m sorry, I couldn’t determine your move-in date. Please contact the park office at {PARK_OFFICE_PHONE}, available {PARK_OFFICE_HOURS}, for more details. Is there anything else I can assist you with?"
         else:
-            if language == "es":
+            if conversation_language == "es":
                 reply = f"Lo siento, no pude determinar tu fecha de mudanza. Por favor, contacta a la oficina del parque al {PARK_OFFICE_PHONE}, disponible {PARK_OFFICE_HOURS}, para más detalles. ¿Hay algo más con lo que pueda ayudarte?"
             else:
                 reply = f"I’m sorry, I couldn’t determine your move-in date. Please contact the park office at {PARK_OFFICE_PHONE}, available {PARK_OFFICE_HOURS}, for more details. Is there anything else I can assist you with?"
         send_sms(from_number, reply)
+        CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": reply})
     elif "phone number" in message_lower:
-        if language == "es":
+        if conversation_language == "es":
             reply = f"Para tu número de teléfono, puedes encontrarlo en tu contrato de arrendamiento o revisando cualquier comunicación reciente de la oficina del parque al {PARK_OFFICE_PHONE}, disponible {PARK_OFFICE_HOURS}. Si necesitas más ayuda, ¡no dudes en preguntar! ¿Hay algo más con lo que pueda ayudarte?"
         else:
             reply = f"For your phone number, you can find it on your lease agreement or by checking any recent communication from the park office at {PARK_OFFICE_PHONE}, available {PARK_OFFICE_HOURS}. If you need further assistance, feel free to ask! Is there anything else I can assist you with?"
         send_sms(from_number, reply)
+        CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": reply})
     else:
-        # Let the AI handle all other queries, including financial ones
-        reply = get_ai_response(message, tenant_data, include_transactions=needs_transactions)
+        reply = get_ai_response(message, tenant_data, conversation_language, message_history, include_transactions=needs_transactions)
         send_sms(from_number, reply)
+        CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": reply})
+
+    # Check if the tenant intends to end the conversation
+    intent = get_ai_response(message, tenant_data, conversation_language, message_history, check_for_end=True)
+    if intent == "END_CONVERSATION":
+        if conversation_language == "es":
+            goodbye_msg = "¡Adiós! Si necesitas más ayuda, no dudes en contactarme."
+        else:
+            goodbye_msg = "Goodbye! Feel free to reach out if you need further assistance."
+        send_sms(from_number, goodbye_msg)
+        CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": goodbye_msg})
+        del CURRENT_CONVERSATIONS[from_number]
+        if from_number in PENDING_IDENTIFICATION:
+            del PENDING_IDENTIFICATION[from_number]
+        logger.info(f"Conversation ended for {from_number} based on AI intent detection")
+        save_conversations()
+    else:
+        save_conversations()
     return "OK"
 
 @app.route("/voice", methods=["POST"])
@@ -1073,8 +1095,6 @@ def send_rent_reminders():
     logger.info("Starting send_rent_reminders")
     logger.info("Rent reminders are disabled because tenant phone numbers are not available.")
     logger.info("Finished send_rent_reminders")
-    # Since we don't have tenant phone numbers, we can't send reminders
-    # This will be updated manually later
     return
 
 @app.route("/send_rent_reminders", methods=["GET"])
