@@ -802,7 +802,7 @@ def check_inactive_conversations():
             inactivity_message = "It’s been a while since your last message. Is there anything else I can assist you with? If not, I’ll close this conversation."
             closure_message = "No response received. I’ve closed this conversation. Feel free to reach out if you need further assistance."
 
-        if time_delta >= 5 and not conversation.get("pending_end", False):  # Reduced to 5 minutes
+        if time_delta >= 2 and not conversation.get("pending_end", False):  # Reduced to 2 minutes
             conversation["pending_end"] = True
             conversation["pending_end_time"] = current_time
             send_sms(phone_number, inactivity_message)
