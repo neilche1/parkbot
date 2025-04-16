@@ -52,7 +52,7 @@ RENT_MANAGER_API_TOKEN = None
 MAINTENANCE_REQUESTS = []
 CALL_LOGS = []
 PENDING_IDENTIFICATION = {}
-CURRENT_CONVERSATIONS = {}  # Maps phone_number to {"tenant_key": (tenant Неправильный формат: tenant_key должен быть кортежем, а не списком), "last_message_time": datetime, "pending_end": bool, "pending_identification": bool, "language": str, "initial_language": str, "message_history": deque}
+CURRENT_CONVERSATIONS = {}  # Maps phone_number to {"tenant_key": (tenant_id, first_name, last_name, unit), "last_message_time": datetime, "pending_end": bool, "pending_identification": bool, "language": str, "initial_language": str, "message_history": deque}
 
 # File path for storing CURRENT_CONVERSATIONS
 CONVERSATIONS_FILE = "current_conversations.json"
@@ -573,6 +573,16 @@ def get_ai_response(user_input, tenant_data, conversation_language, message_hist
         ]
         logger.info(f"Filtered {len(filtered_transactions)} transactions for period {statement_period}")
 
+    # If the query is about rent, try to infer the monthly rent charge from transactions
+    monthly_rent_charge = None
+    if "rent" in user_input.lower() and include_transactions:
+        for transaction in transactions:
+            if "rent" in transaction.get("Comment", "").lower() and transaction.get("TransactionType") != "Payment":
+                monthly_rent_charge = float(transaction.get("Amount", 0.00))
+                break
+    else:
+        monthly_rent_charge = None
+
     if filtered_transactions and include_transactions:
         filtered_transactions.sort(key=lambda x: x.get("TransactionDate", ""), reverse=True)
     
@@ -596,13 +606,7 @@ def get_ai_response(user_input, tenant_data, conversation_language, message_hist
     logger.info(f"Sending {len(filtered_transactions)} transactions to xAI API for tenant {tenant_data.get('tenant_id', 'Unknown')}. Estimated input tokens: {total_input_tokens:.0f}")
     logger.debug(f"Transaction string length: {len(transaction_str)}, Tenant data string length: {len(tenant_data_str)}, Park details string length: {len(park_details_str)}, User input length: {len(user_input_str)}, Message history length: {len(message_history_str)}")
     
-    # Calculate the monthly rent charge based on transaction history
-    monthly_rent_charge = None
-    if include_transactions:
-        for transaction in transactions:
-            if "rent" in transaction.get("Comment", "").lower() and transaction.get("TransactionType") != "Payment":
-                monthly_rent_charge = float(transaction.get("Amount", 0.00))
-                break
+    # Use the inferred monthly rent charge if available
     rent_charge_str = f"${monthly_rent_charge:.2f}" if monthly_rent_charge is not None else "unknown"
     
     # Construct the prompt
@@ -639,6 +643,7 @@ def get_ai_response(user_input, tenant_data, conversation_language, message_hist
             "Provide concise, actionable responses tailored to the tenant’s specific park, provided as 'Tenant is from park: {park_details}'. "
             "Use the tenant's full transaction history ('All transactions: {transactions}') for payment-related queries. "
             "For financial queries (e.g., balance, rent charge, payment history), use the tenant's balance, due date, monthly rent charge, and transaction history. "
+            "If the query is about the tenant's rent (e.g., 'What is my rent?'), use the 'Monthly rent charge' provided in the prompt if available; otherwise, infer it from the transaction history by identifying recurring charges labeled as 'rent'. "
             "For example, if asked 'What did I pay last month?', calculate the total payments made last month from the transaction history. "
             "If asked for a statement (e.g., 'Give me my statement'), generate a detailed statement for the 'Statement period' (if provided), including all charges and payments within that period, and calculate the resulting balance. Format the statement clearly, e.g., 'Here’s your statement for [period]: Charges: [list charges with dates and amounts], Payments: [list payments with dates and amounts], Total Balance: [amount].' "
             "If asked about the rent charge, use the 'Monthly rent charge' if available, or infer from transaction history. "
@@ -777,7 +782,7 @@ def refresh_tenants():
 @app.route("/check_inactive_conversations", methods=["GET"])
 def check_inactive_conversations():
     load_conversations()
-    current多元 = datetime.datetime.now()
+    current_time = datetime.datetime.now()
     conversations_to_close = []
     
     logger.info(f"Checking for inactive conversations at {current_time}")
@@ -929,11 +934,20 @@ def sms_reply():
 
     try:
         tenant_data = TENANTS[tenant_key]
-        # Fetch transactions for financial queries (balance, statement, etc.)
-        if any(keyword in message.lower() for keyword in ["balance", "pay", "due", "payment history", "last payment", "recent transactions", "last month", "rent charge", "statement", "charge for"]):
+        # Fetch transactions for financial queries (balance, statement, rent, etc.)
+        if any(keyword in message.lower() for keyword in ["balance", "pay", "due", "payment history", "last payment", "recent transactions", "last month", "rent charge", "statement", "charge for", "rent"]):
             transactions, last_payment_date = fetch_tenant_transactions(tenant_key[0])
             if transactions is not None:
                 tenant_data["transactions"] = transactions
+                # If the query is specifically about rent, ensure we try to infer it
+                if "rent" in message.lower():
+                    monthly_rent_charge = None
+                    for transaction in transactions:
+                        if "rent" in transaction.get("Comment", "").lower() and transaction.get("TransactionType") != "Payment":
+                            monthly_rent_charge = float(transaction.get("Amount", 0.00))
+                            break
+                    if monthly_rent_charge is not None:
+                        tenant_data["monthly_rent_charge"] = monthly_rent_charge
             if last_payment_date is not None:
                 tenant_data["last_payment_date"] = last_payment_date
     except Exception as e:
