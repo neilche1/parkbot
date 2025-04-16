@@ -63,11 +63,19 @@ def load_conversations():
         if os.path.exists(CONVERSATIONS_FILE):
             with open(CONVERSATIONS_FILE, "r") as f:
                 data = json.load(f)
-                # Convert last_message_time back to datetime objects
+                # Convert last_message_time back to datetime objects and tenant_key back to tuple
                 for phone_number, conversation in data.items():
                     conversation["last_message_time"] = datetime.datetime.fromisoformat(conversation["last_message_time"])
                     if "pending_end_time" in conversation and conversation["pending_end_time"]:
                         conversation["pending_end_time"] = datetime.datetime.fromisoformat(conversation["pending_end_time"])
+                    # Convert tenant_key list back to tuple if it exists
+                    if "tenant_key" in conversation and conversation["tenant_key"] is not None:
+                        if isinstance(conversation["tenant_key"], list):
+                            conversation["tenant_key"] = tuple(conversation["tenant_key"])
+                            logger.debug(f"Converted tenant_key to tuple for {phone_number}: {conversation['tenant_key']}")
+                        elif not isinstance(conversation["tenant_key"], tuple):
+                            logger.error(f"Invalid tenant_key type for {phone_number}: {type(conversation['tenant_key'])}. Expected tuple or list, got {conversation['tenant_key']}")
+                            conversation["tenant_key"] = None  # Reset to None to force re-identification
                     conversation["message_history"] = deque(conversation.get("message_history", []), maxlen=5)
                 CURRENT_CONVERSATIONS = data
                 logger.info("Loaded CURRENT_CONVERSATIONS from file")
@@ -881,7 +889,35 @@ def sms_reply():
 
     # Handle tenant's query
     tenant_key = CURRENT_CONVERSATIONS[from_number]["tenant_key"]
-    tenant_data = TENANTS[tenant_key]
+    # Validate tenant_key type
+    if not isinstance(tenant_key, tuple):
+        logger.error(f"Invalid tenant_key type for {from_number}: {type(tenant_key)}. Expected tuple, got {tenant_key}")
+        if conversation_language == "es":
+            error_msg = "Lo siento, hubo un problema al procesar tu solicitud. Por favor, identifícate nuevamente con tu nombre, apellido o número de unidad."
+        else:
+            error_msg = "I’m sorry, there was an issue processing your request. Please identify yourself again with your first name, last name, or unit number."
+        send_sms(from_number, error_msg)
+        CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": error_msg})
+        CURRENT_CONVERSATIONS[from_number]["tenant_key"] = None
+        CURRENT_CONVERSATIONS[from_number]["pending_identification"] = True
+        save_conversations()
+        return "OK"
+
+    try:
+        tenant_data = TENANTS[tenant_key]
+    except Exception as e:
+        logger.error(f"Error accessing tenant data for {from_number} with tenant_key {tenant_key}: {str(e)}")
+        if conversation_language == "es":
+            error_msg = "Lo siento, hubo un problema al procesar tu solicitud. Por favor, identifícate nuevamente con tu nombre, apellido o número de unidad."
+        else:
+            error_msg = "I’m sorry, there was an issue processing your request. Please identify yourself again with your first name, last name, or unit number."
+        send_sms(from_number, error_msg)
+        CURRENT_CONVERSATIONS[from_number]["message_history"].append({"role": "bot", "content": error_msg})
+        CURRENT_CONVERSATIONS[from_number]["tenant_key"] = None
+        CURRENT_CONVERSATIONS[from_number]["pending_identification"] = True
+        save_conversations()
+        return "OK"
+
     message_lower = message.lower()
 
     if "maintenance" in message_lower or "fix" in message_lower or "broken" in message_lower or "leak" in message_lower or "leaking" in message_lower or "flood" in message_lower or "damage" in message_lower or "repair" in message_lower or "clog" in message_lower or "power" in message_lower:
